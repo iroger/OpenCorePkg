@@ -194,6 +194,8 @@ OcMiscEarlyInit (
   CHAR8                     *ConfigData;
   UINT32                    ConfigDataSize;
   EFI_TIME                  BootTime;
+  CONST CHAR8               *AsciiVault;
+  OCS_VAULT_MODE            Vault;
 
   ConfigData = OcStorageReadFileUnicode (
     Storage,
@@ -218,16 +220,29 @@ OcMiscEarlyInit (
     return EFI_UNSUPPORTED; ///< Should be unreachable.
   }
 
+  AsciiVault = OC_BLOB_GET (&Config->Misc.Security.Vault);
+  if (AsciiStrCmp (AsciiVault, "Secure") == 0) {
+    Vault = OcsVaultSecure;
+  } else if (AsciiStrCmp (AsciiVault, "Optional") == 0) {
+    Vault = OcsVaultOptional;
+  } else if (AsciiStrCmp (AsciiVault, "Basic") == 0) {
+    Vault = OcsVaultBasic;
+  } else {
+    DEBUG ((DEBUG_ERROR, "OC: Invalid Vault mode: %a\n", AsciiVault));
+    CpuDeadLoop ();
+    return EFI_UNSUPPORTED; ///< Should be unreachable.
+  }
+
   //
   // Sanity check that the configuration is adequate.
   //
-  if (!Storage->HasVault && Config->Misc.Security.RequireVault) {
+  if (!Storage->HasVault && Vault >= OcsVaultBasic) {
     DEBUG ((DEBUG_ERROR, "OC: Configuration requires vault but no vault provided!\n"));
     CpuDeadLoop ();
     return EFI_SECURITY_VIOLATION; ///< Should be unreachable.
   }
 
-  if (VaultKey == NULL && Config->Misc.Security.RequireSignature) {
+  if (VaultKey == NULL && Vault >= OcsVaultSecure) {
     DEBUG ((DEBUG_ERROR, "OC: Configuration requires signed vault but no public key provided!\n"));
     CpuDeadLoop ();
     return EFI_SECURITY_VIOLATION; ///< Should be unreachable.
@@ -251,11 +266,11 @@ OcMiscEarlyInit (
 
   DEBUG ((
     DEBUG_INFO,
-    "OC: OpenCore is now loading (Vault: %d/%d, Sign %d/%d)...\n",
+    "OC: OpenCore %a is loading in %a mode (%d/%d)...\n",
+    OcMiscGetVersionString (),
+    AsciiVault,
     Storage->HasVault,
-    Config->Misc.Security.RequireVault,
-    VaultKey != NULL,
-    Config->Misc.Security.RequireSignature
+    VaultKey != NULL
     ));
 
   Status = gRT->GetTime (&BootTime, NULL);
@@ -290,10 +305,6 @@ OcMiscLateInit (
 {
   EFI_STATUS   Status;
   EFI_STATUS   HibernateStatus;
-  UINT32       Width;
-  UINT32       Height;
-  UINT32       Bpp;
-  BOOLEAN      SetMax;
   CONST CHAR8  *HibernateMode;
   UINT32       HibernateMask;
 
@@ -318,76 +329,6 @@ OcMiscLateInit (
     }
   }
 
-  ParseScreenResolution (
-    OC_BLOB_GET (&Config->Misc.Boot.Resolution),
-    &Width,
-    &Height,
-    &Bpp,
-    &SetMax
-    );
-
-  DEBUG ((
-    DEBUG_INFO,
-    "OC: Requested resolution is %ux%u@%u (max: %d) from %a\n",
-    Width,
-    Height,
-    Bpp,
-    SetMax,
-    OC_BLOB_GET (&Config->Misc.Boot.Resolution)
-    ));
-
-  if (SetMax || (Width > 0 && Height > 0)) {
-    Status = SetConsoleResolution (
-      Width,
-      Height,
-      Bpp,
-      OcShouldReconnectConsoleOnResolutionChange (Config)
-      );
-    DEBUG ((
-      EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
-      "OC: Changed resolution to %ux%u@%u (max: %d) from %a - %r\n",
-      Width,
-      Height,
-      Bpp,
-      SetMax,
-      OC_BLOB_GET (&Config->Misc.Boot.Resolution),
-      Status
-      ));
-  }
-
-  ParseConsoleMode (
-    OC_BLOB_GET (&Config->Misc.Boot.ConsoleMode),
-    &Width,
-    &Height,
-    &SetMax
-    );
-
-  DEBUG ((
-    DEBUG_INFO,
-    "OC: Requested console mode is %ux%u (max: %d) from %a\n",
-    Width,
-    Height,
-    SetMax,
-    OC_BLOB_GET (&Config->Misc.Boot.ConsoleMode)
-    ));
-
-  if (SetMax || (Width > 0 && Height > 0)) {
-    Status = SetConsoleMode (Width, Height);
-    DEBUG ((
-      EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
-      "OC: Changed console mode to %ux%u (max: %d) from %a - %r\n",
-      Width,
-      Height,
-      SetMax,
-      OC_BLOB_GET (&Config->Misc.Boot.ConsoleMode),
-      Status
-      ));
-  }
-
-  if (Config->Misc.Boot.BuiltinTextRenderer) {
-    OcInstallCustomConOut ();
-  }
-
   HibernateMode = OC_BLOB_GET (&Config->Misc.Boot.HibernateMode);
 
   if (AsciiStrCmp (HibernateMode, "None") == 0) {
@@ -407,7 +348,6 @@ OcMiscLateInit (
 
   HibernateStatus = OcActivateHibernateWake (HibernateMask);
   DEBUG ((DEBUG_INFO, "OC: Hibernation detection status is %r\n", HibernateStatus));
-  (VOID) HibernateStatus;
 
   return Status;
 }
@@ -425,17 +365,32 @@ OcMiscBoot (
   EFI_STATUS             Status;
   OC_PICKER_CONTEXT      *Context;
   OC_PICKER_CMD          PickerCommand;
+  OC_PICKER_MODE         PickerMode;
   UINTN                  ContextSize;
   UINT32                 Index;
   UINT32                 EntryIndex;
   OC_INTERFACE_PROTOCOL  *Interface;
   UINTN                  BlessOverrideSize;
   CHAR16                 **BlessOverride;
+  CONST CHAR8            *AsciiPicker;
+
+  AsciiPicker = OC_BLOB_GET (&Config->Misc.Boot.PickerMode);
+
+  if (AsciiStrCmp (AsciiPicker, "Builtin") == 0) {
+    PickerMode = OcPickerModeBuiltin;
+  } else if (AsciiStrCmp (AsciiPicker, "External") == 0) {
+    PickerMode = OcPickerModeExternal;
+  } else if (AsciiStrCmp (AsciiPicker, "Apple") == 0) {
+    PickerMode = OcPickerModeApple;
+  } else {
+    DEBUG ((DEBUG_WARN, "OC: Unknown PickirMode: %a, using builtin\n", AsciiPicker));
+    PickerMode = OcPickerModeBuiltin;
+  }
 
   //
   // Do not use our boot picker unless asked.
   //
-  if (!Config->Misc.Boot.UsePicker) {
+  if (PickerMode == OcPickerModeExternal) {
     DEBUG ((DEBUG_INFO, "OC: Handing off to external boot controller\n"));
 
     Status = gBS->LocateProtocol (
@@ -443,19 +398,19 @@ OcMiscBoot (
       NULL,
       (VOID **) &Interface
       );
-    if (EFI_ERROR (Status)) {
+    if (!EFI_ERROR (Status)) {
+      if (Interface->Revision != OC_INTERFACE_REVISION) {
+        DEBUG ((
+          DEBUG_INFO,
+          "OC: Incompatible external GUI protocol - %u vs %u\n",
+          Interface->Revision,
+          OC_INTERFACE_REVISION
+          ));
+        Interface = NULL;
+      }
+    } else {
       DEBUG ((DEBUG_INFO, "OC: Missing external GUI protocol - %r\n", Status));
-      return;
-    }
-
-    if (Interface->Revision != OC_INTERFACE_REVISION) {
-      DEBUG ((
-        DEBUG_INFO,
-        "OC: Incompatible external GUI protocol - %u vs %u\n",
-        Interface->Revision,
-        OC_INTERFACE_REVISION
-        ));
-      return;
+      Interface = NULL;
     }
   } else {
     Interface = NULL;
@@ -530,7 +485,8 @@ OcMiscBoot (
   Context->CustomRead         = OcToolLoadEntry;
   Context->PrivilegeContext   = Privilege;
   Context->RequestPrivilege   = OcShowSimplePasswordRequest;
-  Context->BalloonAllocator   = OcGetBallooningHandler (Config);
+  Context->PickerMode         = PickerMode;
+  Context->ConsoleAttributes  = Config->Misc.Boot.PickerAttributes;
 
   if ((Config->Misc.Security.ExposeSensitiveData & OCS_EXPOSE_VERSION_UI) != 0) {
     Context->TitleSuffix      = OcMiscGetVersionString ();
@@ -609,21 +565,4 @@ OcMiscUefiQuirksLoaded (
     sizeof (Config->Misc.Security.ScanPolicy),
     &Config->Misc.Security.ScanPolicy
     );
-
-  //
-  // Regardless of the mode ensure our cursor is disabled as we do not need it.
-  // This is a bit ugly, but works for most platforms we have:
-  // - Firstly disable it on platforms that start with it for whatever reason.
-  //   Generally Insyde laptops are happy with that.
-  // - Secondly change the mode, on APTIO it may reenable the cursor in Text mode.
-  // - Thirdly disable it again to ensure it is definitely disabled.
-  //
-
-  OcConsoleDisableCursor ();
-  OcConsoleControlSetBehaviour (
-    ParseConsoleControlBehaviour (
-      OC_BLOB_GET (&Config->Misc.Boot.ConsoleBehaviourUi)
-      )
-    );
-  OcConsoleDisableCursor ();
 }
